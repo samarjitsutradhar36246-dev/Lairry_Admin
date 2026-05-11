@@ -1,0 +1,8 @@
+{
+  "projects": {
+    "default": "lairry-admin",
+    "lairryadmin": "lairry-admin"
+  },
+  "targets": {},
+  "etags": {}
+}
