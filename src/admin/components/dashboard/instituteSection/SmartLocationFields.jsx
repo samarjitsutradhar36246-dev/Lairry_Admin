@@ -1,12 +1,7 @@
 // src/components/SmartLocationFields.jsx
-// Changes from previous version:
-// - Nominatim URL changed to /nominatim/search (Vite proxy) to fix CORS + 429
-// - Debounce 2000ms maintained
-// - fetchSuggestions scoped to city+state with progressive fallback
-
 import { useState, useEffect, useRef } from "react";
 import { State, City } from "country-state-city";
-import { AlertCircle, Loader2, Search, Lock, MapPin, X } from "lucide-react";
+import { AlertCircle, Loader2, Search, Lock, X } from "lucide-react";
 
 const inputClass = `w-full rounded-xl px-4 py-3 
   bg-white dark:bg-slate-800/50 
@@ -40,12 +35,10 @@ const ErrorMsg = ({ msg }) =>
 
 const INDIA_ISO = "IN";
 
-// ── Nominatim base — goes through Vite proxy to avoid CORS + rate-limit ────────
-const NOMINATIM = "/nominatim/search";
-
 // ── Debounce hook ─────────────────────────────────────────────────────────────
 function useDebounce(value, delay) {
   const [debounced, setDebounced] = useState(value);
+  const placeAtRef = useRef(null);
   useEffect(() => {
     const t = setTimeout(() => setDebounced(value), delay);
     return () => clearTimeout(t);
@@ -53,39 +46,57 @@ function useDebounce(value, delay) {
   return debounced;
 }
 
-// ── Fetch Nominatim suggestions — city+state scoped, progressive fallback ──────
-async function fetchSuggestions(query, city, state) {
-  // Query ko strong banao: "Battala, Agartala, Tripura, India"
-  const searchParts = [query];
-  if (city) searchParts.push(city);
-  if (state) searchParts.push(state);
-  searchParts.push("India");
+// ── Nominatim search — scoped to city+state for hyper-local results ───────────
+// Strategy: Try narrow query (locality + city + state) first.
+// If results < 2, fall back to broader query (locality + state).
+async function searchLocality(query, city, state) {
+  if (!query || query.trim().length < 2) return [];
 
-  const fullQuery = searchParts.filter(Boolean).join(", ");
+  const makeParams = (q) =>
+    new URLSearchParams({
+      q,
+      countrycodes: "in",
+      format: "json",
+      limit: "7",
+      addressdetails: "1",
+    });
 
-  const params = new URLSearchParams({
-    q: fullQuery,
-    countrycodes: "in",
-    format: "json",
-    limit: "6",
-    addressdetails: "1",
-  });
+  // Narrow: "Battala, Agartala, Tripura, India"
+  const narrowParts = [query.trim(), city, state, "India"].filter(Boolean);
+  const narrowQuery = narrowParts.join(", ");
 
   try {
-    const res = await fetch(`${NOMINATIM}?${params}`, {
+    const res = await fetch(`/nominatim/search?${makeParams(narrowQuery)}`, {
       headers: { "Accept-Language": "en" },
     });
     if (!res.ok) return [];
-    return await res.json();
-  } catch (err) {
+    const data = await res.json();
+    if (Array.isArray(data) && data.length >= 2) return data;
+
+    // Fallback: "Battala, Tripura, India" (drop city, keep state)
+    const broadParts = [query.trim(), state, "India"].filter(Boolean);
+    const broadQuery = broadParts.join(", ");
+    const res2 = await fetch(`/nominatim/search?${makeParams(broadQuery)}`, {
+      headers: { "Accept-Language": "en" },
+    });
+    if (!res2.ok) return data ?? [];
+    const data2 = await res2.json();
+    // Merge and deduplicate by place_id
+    const merged = [...(data ?? []), ...(Array.isArray(data2) ? data2 : [])];
+    const seen = new Set();
+    return merged.filter((p) => {
+      if (seen.has(p.place_id)) return false;
+      seen.add(p.place_id);
+      return true;
+    });
+  } catch {
     return [];
   }
 }
 
-// ── Shorten a Nominatim display_name for showing in dropdown ─────────────────
-function shortenName(displayName) {
-  const parts = displayName.split(", ");
-  return parts.slice(0, 4).join(", ");
+// Show first 3–4 meaningful parts of a Nominatim display_name
+function shortenName(displayName = "") {
+  return displayName.split(", ").slice(0, 4).join(", ");
 }
 
 // ── Street Autocomplete Input ─────────────────────────────────────────────────
@@ -102,52 +113,65 @@ function StreetAutocomplete({
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [highlightedIdx, setHighlightedIdx] = useState(-1);
-  const [selectedFromSuggestion, setSelectedFromSuggestion] = useState(false);
   const wrapperRef = useRef(null);
   const inputRef = useRef(null);
-  const abortRef = useRef(null);
 
-  const debouncedValue = useDebounce(value, 2000);
-
-  const handleManualFetch = async () => {
-    if (!value || value.trim().length < 2) {
-      // Yahan alert ya state set kar sakte ho
-      return;
-    }
-
-    setLoading(true);
-    setOpen(false);
-
-    try {
-      // Ye function wahi query banayega jo Battala, Agartala ko dhund sake
-      const results = await fetchSuggestions(value, city, state);
-
-      if (results.length > 0) {
-        setSuggestions(results);
-        setOpen(true);
-        setHighlightedIdx(-1);
-      } else {
-        // Agar kuch na mile
-        console.log("No results found");
-      }
-    } catch (err) {
-      console.error("Fetch error:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // Live debounced search — fires automatically as user types (600ms)
+  const debouncedValue = useDebounce(value, 600);
 
   useEffect(() => {
+    if (!debouncedValue || debouncedValue.trim().length < 2) {
+      setSuggestions([]);
+      setOpen(false);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    searchLocality(debouncedValue, city, state).then((results) => {
+      if (cancelled) return;
+      setSuggestions(results);
+      setOpen(results.length > 0);
+      setHighlightedIdx(-1);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedValue, city, state]);
+
+  // Manual search — Search button / Enter key (no debounce wait)
+  const runSearch = async () => {
+    if (!value || value.trim().length < 2) return;
+    setLoading(true);
+    setOpen(false);
+    const results = await searchLocality(value, city, state);
+    setSuggestions(results);
+    setOpen(results.length > 0);
+    setHighlightedIdx(-1);
+    setLoading(false);
+  };
+
+  // Close on outside click
+  useEffect(() => {
     const handler = (e) => {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target)) {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target))
         setOpen(false);
-      }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
   const handleKeyDown = (e) => {
+    if (e.key === "Enter") {
+      if (open && highlightedIdx >= 0) {
+        e.preventDefault();
+        handleSelect(suggestions[highlightedIdx]);
+      } else {
+        e.preventDefault();
+        runSearch();
+      }
+      return;
+    }
     if (!open || suggestions.length === 0) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -155,9 +179,6 @@ function StreetAutocomplete({
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setHighlightedIdx((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter" && highlightedIdx >= 0) {
-      e.preventDefault();
-      handleSelect(suggestions[highlightedIdx]);
     } else if (e.key === "Escape") {
       setOpen(false);
     }
@@ -165,7 +186,7 @@ function StreetAutocomplete({
 
   const handleSelect = (suggestion) => {
     const shortName = shortenName(suggestion.display_name);
-    setSelectedFromSuggestion(true);
+    onChange(shortName);
     setSuggestions([]);
     setOpen(false);
     setHighlightedIdx(-1);
@@ -185,54 +206,84 @@ function StreetAutocomplete({
   };
 
   return (
-    <div className="relative">
-      <input
-        ref={inputRef}
-        placeholder="e.g. Battala, MG Road, Sector 15"
-        value={value}
-        onChange={(e) => {
-          onChange(e.target.value);
-          setSelectedFromSuggestion(false);
-        }}
-        // Keydown logic: Enter par manual fetch chalega
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !open) {
-            e.preventDefault();
-            handleManualFetch();
-          } else {
-            handleKeyDown(e);
-          }
-        }}
-        disabled={disabled}
-        autoComplete="off"
-        className={`${inputClass} pr-20`} // Padding badhai hai button ke liye
-      />
+    <div className="relative" ref={wrapperRef}>
+      <div className="relative">
+        <input
+          ref={inputRef}
+          placeholder="e.g. Battala, MG Road, Ramnagar Chowmuhani"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onFocus={() => suggestions.length > 0 && setOpen(true)}
+          disabled={disabled}
+          autoComplete="off"
+          className={`${inputClass} pr-20`}
+        />
 
-      {/* Search aur Clear Buttons ka Group */}
-      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
-        {value && !loading && (
+        {/* Action buttons */}
+        <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+          {value && !loading && (
+            <button
+              type="button"
+              onClick={handleClear}
+              className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-slate-300 transition-colors">
+              <X size={16} />
+            </button>
+          )}
           <button
             type="button"
-            onClick={handleClear}
-            className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-slate-300 transition-colors">
-            <X size={16} />
+            onClick={runSearch}
+            disabled={loading || !value || disabled}
+            title="Search this locality"
+            className="flex items-center justify-center w-8 h-8 rounded-lg 
+              bg-cyan-500 hover:bg-cyan-600 text-white 
+              transition-all duration-200 disabled:opacity-50 shadow-md">
+            {loading ? (
+              <Loader2 size={16} className="animate-spin" />
+            ) : (
+              <Search size={16} />
+            )}
           </button>
-        )}
-
-        <button
-          type="button"
-          onClick={handleManualFetch}
-          disabled={loading || !value || disabled}
-          className="flex items-center justify-center w-8 h-8 rounded-lg 
-                     bg-cyan-500 hover:bg-cyan-600 text-white 
-                     transition-all duration-200 disabled:opacity-50 shadow-md">
-          {loading ? (
-            <Loader2 size={16} className="animate-spin" />
-          ) : (
-            <Search size={16} />
-          )}
-        </button>
+        </div>
       </div>
+
+      {/* Dropdown */}
+      {open && suggestions.length > 0 && (
+        <ul
+          className="absolute z-[9999] top-full left-0 right-0 mt-1 rounded-xl
+          bg-white dark:bg-slate-900 
+          border border-gray-200 dark:border-slate-700 
+          shadow-xl max-h-60 overflow-y-auto">
+          {suggestions.map((place, i) => {
+            const parts = (place.display_name || "").split(", ");
+            const title = parts.slice(0, 2).join(", ");
+            const subtitle = parts.slice(2, 5).join(", ");
+            return (
+              <li
+                key={place.place_id ?? i}
+                onMouseDown={() => handleSelect(place)}
+                className={`px-4 py-3 cursor-pointer border-b border-gray-100 dark:border-slate-800 
+                  last:border-0 transition-colors
+                  ${
+                    highlightedIdx === i
+                      ? "bg-cyan-50 dark:bg-cyan-500/10"
+                      : "hover:bg-gray-50 dark:hover:bg-slate-800/60"
+                  }`}>
+                <div className="text-sm font-medium text-gray-900 dark:text-white truncate">
+                  {title}
+                </div>
+                {subtitle && (
+                  <div className="text-xs text-gray-500 dark:text-slate-400 truncate mt-0.5">
+                    {subtitle}
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {error && <ErrorMsg msg={error} />}
     </div>
   );
 }
@@ -248,11 +299,12 @@ const SmartLocationFields = ({
   const [pinError, setPinError] = useState("");
   const [pinSuccess, setPinSuccess] = useState(false);
 
+  // Always India
   useEffect(() => {
     if (newInstitute.location_country !== "India") {
       setNewInstitute((prev) => ({ ...prev, location_country: "India" }));
     }
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const stateList = State.getStatesOfCountry(INDIA_ISO);
   const selectedState = stateList.find(
@@ -328,17 +380,18 @@ const SmartLocationFields = ({
       latitude: lat,
       longitude: lon,
     }));
+    // Map ko directly fly karo — no debounce wait
+    if (placeAtRef.current) placeAtRef.current(lat, lon);
   };
 
   return (
     <div className="space-y-4">
-      {/* ── Row 1: PIN + Country ──────────────────────────────────────────── */}
+      {/* ── Row 1: PIN + Country ───────────────────────────────────────── */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         {/* PIN */}
         <div className="flex flex-col gap-2">
           <label className={labelClass}>
-            PIN Code
-            <span className="text-red-500 dark:text-red-400">*</span>
+            PIN Code <span className="text-red-500 dark:text-red-400">*</span>
           </label>
           <p className="text-xs text-cyan-500 dark:text-cyan-400">
             Enter PIN to auto-fill city &amp; state
@@ -349,7 +402,9 @@ const SmartLocationFields = ({
               value={newInstitute.location_pin}
               onChange={handlePinChange}
               onKeyDown={handlePinKeyDown}
-              disabled={isSaving}
+              disabled={
+                isSaving || !!(newInstitute.latitude && newInstitute.longitude)
+              }
               maxLength={6}
               inputMode="numeric"
               className={inputClass}
@@ -385,7 +440,7 @@ const SmartLocationFields = ({
           <ErrorMsg msg={errors.location_pin} />
         </div>
 
-        {/* Country — FIXED to India */}
+        {/* Country — fixed to India */}
         <div className="flex flex-col gap-2">
           <label className={labelClass}>Country</label>
           <p className="text-xs text-transparent select-none pointer-events-none">
@@ -408,13 +463,12 @@ const SmartLocationFields = ({
         </div>
       </div>
 
-      {/* ── Row 2: State + City ───────────────────────────────────────────── */}
+      {/* ── Row 2: State + City ────────────────────────────────────────── */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         {/* State */}
         <div className="flex flex-col gap-2">
           <label className={labelClass}>
-            State
-            <span className="text-red-500 dark:text-red-400">*</span>
+            State <span className="text-red-500 dark:text-red-400">*</span>
           </label>
           <select
             value={newInstitute.location_state}
@@ -434,7 +488,7 @@ const SmartLocationFields = ({
         {/* City */}
         <div className="flex flex-col gap-2">
           <label className={labelClass}>
-            City / District
+            City / District{" "}
             <span className="text-red-500 dark:text-red-400">*</span>
           </label>
           {cityList.length > 0 ? (
@@ -508,14 +562,14 @@ const SmartLocationFields = ({
         </div>
       </div>
 
-      {/* ── Street / Locality with Autocomplete ──────────────────────────── */}
+      {/* ── Street / Locality with live autocomplete ───────────────────── */}
       <div className="flex flex-col gap-2">
         <label className={labelClass}>
           Street / Locality / Landmark
           <span className="text-red-500 dark:text-red-400">*</span>
         </label>
         <p className="text-xs text-cyan-500 dark:text-cyan-400">
-          Type to see suggestions — select one to auto-pin on map
+          Type locality name — dropdown will appear, select to auto-pin on map
         </p>
         <StreetAutocomplete
           value={newInstitute.street_address || ""}
@@ -525,9 +579,16 @@ const SmartLocationFields = ({
           onSelect={handleStreetSelect}
           city={newInstitute.location_city}
           state={newInstitute.location_state}
-          disabled={isSaving}
+          disabled={
+            isSaving || !!(newInstitute.latitude && newInstitute.longitude)
+          }
           error={errors.street_address}
         />
+        {!!(newInstitute.latitude && newInstitute.longitude) && (
+          <span className="text-xs text-cyan-400 flex items-center gap-1 mt-1">
+            📍 Map se auto-filled — pin reset karein to edit karein
+          </span>
+        )}
       </div>
     </div>
   );

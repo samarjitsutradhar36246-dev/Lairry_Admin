@@ -462,6 +462,7 @@ const AddInstituteModal = ({
                 setNewInstitute={setNewInstitute}
                 errors={errors}
                 isSaving={isSaving}
+                placeAtRef={placeAtRef}
               />
 
               {/* Location Picker */}
@@ -476,6 +477,7 @@ const AddInstituteModal = ({
                 <LocationPicker
                   newInstitute={newInstitute}
                   setNewInstitute={setNewInstitute}
+                  onReady={(fn) => (placeAtRef.current = fn)}
                 />
                 <div
                   className="flex gap-4 p-3 rounded-xl 

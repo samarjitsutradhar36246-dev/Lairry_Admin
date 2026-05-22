@@ -2,9 +2,9 @@ import emailjs from "@emailjs/browser";
 import NotificationService from "../services/NotificationService";
 
 // Aapki EmailJS Keys directly yahan daal di hain
-const EMAILJS_SERVICE = "service_hzdvu8e";
-const WELCOME_TEMPLATE_ID = "template_nu3fk3u"; // Filhal wahi Contact Us wala template use kar rahe hain
+const EMAILJS_SERVICE = "service_ulkn554"; // smtp server id
 const GENERIC_TEMPLATE_ID = "template_nu3fk3u"; // Bulk emails ke liye bhi same template
+const WELCOME_TEMPLATE_ID = "template_nu3fk3u"; // Welcome email (same template)
 const EMAILJS_USER_ID = "jXZpEYlzVAdJbACvd";    // Aapki Public Key
 
 /**
@@ -46,7 +46,7 @@ export const sendBulkEmails = async (recipients, subject, body) => {
           {
             name: "Larry", 
             subject: subject,                    // Subject
-            message: body,                       // Template ka {{message}}
+            message: body,                       // Template  {{message}}
             to_email: recipient.email,
           },
           EMAILJS_USER_ID
